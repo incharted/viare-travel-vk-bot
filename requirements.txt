@@ -1,0 +1,5 @@
+vkbottle==4.6.2
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+certifi>=2024.0.0
+openpyxl==3.1.5

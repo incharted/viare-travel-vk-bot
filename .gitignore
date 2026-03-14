@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+.env.prod
+data/*.sqlite3
+data/*.db
+data/*.log
+data/*.log.*
+data/exports/
+data/bot.lock
