@@ -34,6 +34,12 @@ def get_main_menu_keyboard() -> str:
     keyboard.add(Text("Подобрать тур"), color=KeyboardButtonColor.PRIMARY)
     keyboard.add(Text("Все туры"), color=KeyboardButtonColor.POSITIVE)
     keyboard.row()
+    keyboard.add(Text("Мои заявки"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("Мой статус"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("Избранное"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
+    keyboard.add(Text("Как пользоваться"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
     keyboard.add(Text("FAQ"), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("Контакты"), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("Оплата и бронирование"), color=KeyboardButtonColor.SECONDARY)
@@ -48,6 +54,7 @@ def get_main_menu_keyboard() -> str:
 def get_welcome_keyboard() -> str:
     keyboard = Keyboard(one_time=True, inline=False)
     keyboard.add(Text("Что умеет бот?"), color=KeyboardButtonColor.PRIMARY)
+    keyboard.add(Text("Как пользоваться"), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
 
@@ -64,7 +71,13 @@ def get_staff_menu_keyboard(role: str) -> str:
     keyboard.add(Text("Карточка заявки"), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("Ответ по заявке"), color=KeyboardButtonColor.POSITIVE)
     keyboard.row()
+    keyboard.add(Text("Закрепить заявку"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("Шаблон ответа"), color=KeyboardButtonColor.POSITIVE)
+    keyboard.add(Text("Шаблоны ответов"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
     keyboard.add(Text("Закрыть заявку"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("Календарь менеджеров"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("Помощь по панели"), color=KeyboardButtonColor.SECONDARY)
 
     if role == "admin":
         keyboard.add(Text("Статистика"), color=KeyboardButtonColor.SECONDARY)
@@ -72,14 +85,22 @@ def get_staff_menu_keyboard(role: str) -> str:
         keyboard.row()
         keyboard.add(Text("Выгрузка заявок"), color=KeyboardButtonColor.SECONDARY)
         keyboard.add(Text("Туры админ"), color=KeyboardButtonColor.SECONDARY)
+        keyboard.add(Text("Менеджеры"), color=KeyboardButtonColor.SECONDARY)
+        keyboard.add(Text("Добавить менеджера"), color=KeyboardButtonColor.SECONDARY)
+        keyboard.add(Text("Убрать менеджера"), color=KeyboardButtonColor.SECONDARY)
         keyboard.row()
+        keyboard.add(Text("Как назначить менеджера"), color=KeyboardButtonColor.SECONDARY)
+        keyboard.add(Text("PDF КП"), color=KeyboardButtonColor.POSITIVE)
         keyboard.add(Text("FAQ текст"), color=KeyboardButtonColor.SECONDARY)
         keyboard.add(Text("Контакты текст"), color=KeyboardButtonColor.SECONDARY)
         keyboard.add(Text("Оплата текст"), color=KeyboardButtonColor.SECONDARY)
         keyboard.row()
+        keyboard.add(Text("Разблокировать VK"), color=KeyboardButtonColor.SECONDARY)
         keyboard.add(Text("Рассылка"), color=KeyboardButtonColor.SECONDARY)
+        keyboard.row()
+    else:
+        keyboard.row()
 
-    keyboard.row()
     keyboard.add(Text("Выйти из панели"), color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
     keyboard.add(Text("В меню"), color=KeyboardButtonColor.NEGATIVE)

@@ -14,15 +14,19 @@ def _format_price(value: int | None) -> str:
 def format_tour_card(tour: dict, travelers: int) -> str:
     total_price = int(tour["price_per_person"]) * travelers
     destination = tour.get("destination") or tour["country"]
+    price_per_person_text = _format_price(int(tour["price_per_person"]))
+    total_price_text = _format_price(total_price)
     lines = [
-        f"{tour['name']}",
-        "",
+        f"ТУР: {tour['name']}",
+        "------------------------------",
+        f"ID тура: {tour.get('id', '-')}",
         f"Направление: {destination}",
-        f"Формат: {tour['rest_type']}",
+        f"Формат отдыха: {tour['rest_type']}",
         f"Длительность: {tour['duration_days']} дн.",
-        f"Цена за человека: {_format_price(int(tour['price_per_person']))} ₽",
-        f"Итого на {travelers} чел.: {_format_price(total_price)} ₽",
+        f"Цена за человека: {price_per_person_text} ₽",
+        f"Итого на {travelers} чел.: {total_price_text} ₽",
         "",
+        "Описание:",
         f"{tour['description']}",
     ]
 
@@ -60,14 +64,17 @@ def build_tour_catalog_messages(tours: list[dict], max_len: int = 3500) -> list[
         ):
             destination = str(tour.get("destination") or tour["country"])
             lines.append(
-                f"{index}. {tour['name']}\n"
+                f"{index}. [{tour.get('id', '-')}] {tour['name']}\n"
                 f"   {destination} | {tour['duration_days']} дн. | от {_format_price(int(tour['price_per_person']))} ₽/чел.\n"
                 f"   {tour['description']}"
             )
         sections.append("\n\n".join(lines))
 
     messages: list[str] = []
-    current = "Каталог туров VIARE Travel\n"
+    current = (
+        "Каталог туров VIARE Travel\n"
+        "Подсказка: чтобы сохранить тур, используйте /fav (потом введите ID тура).\n"
+    )
     for section in sections:
         block = f"\n\n{section}"
         if len(current) + len(block) > max_len:
@@ -93,7 +100,8 @@ def format_request_summary_for_confirmation(payload: dict) -> str:
     if rest_type == "any":
         rest_type = "любой"
     return (
-        "Проверьте заявку перед отправкой:\n"
+        "ПРОВЕРЬТЕ ЗАЯВКУ ПЕРЕД ОТПРАВКОЙ\n"
+        "------------------------------\n"
         f"Формат поездки: {scope_label}\n"
         f"Направление: {destination}\n"
         f"Бюджет: {_format_price(payload.get('budget'))} ₽\n"
@@ -112,11 +120,14 @@ def format_request_card(request: dict) -> str:
     else:
         scope_label = "Не указан"
     manager_text = "Да" if int(request.get("manager_required") or 0) == 1 else "Нет"
+    assigned_manager_vk_id = request.get("assigned_manager_vk_id")
+    assigned_text = f"vk={assigned_manager_vk_id}" if assigned_manager_vk_id else "не назначен"
     rest_type = request.get("rest_type") or "не указан"
     if rest_type == "any":
         rest_type = "любой"
     return (
-        f"Карточка заявки #{request['id']}\n"
+        f"ЗАЯВКА #{request['id']}\n"
+        "------------------------------\n"
         f"Статус: {request_status_label(str(request.get('status') or ''))}\n"
         f"Клиент VK: {request['vk_id']}\n"
         f"Формат поездки: {scope_label}\n"
@@ -126,6 +137,8 @@ def format_request_card(request: dict) -> str:
         f"Даты: {request.get('start_date') or 'не указаны'} - {request.get('end_date') or 'не указаны'}\n"
         f"Тип отдыха: {rest_type}\n"
         f"Нужен менеджер: {manager_text}\n"
+        f"Ответственный менеджер: {assigned_text}\n"
+        "------------------------------\n"
         f"Создана: {request.get('created_at')}\n"
         f"Обновлена: {request.get('updated_at') or request.get('created_at')}"
     )
@@ -135,9 +148,14 @@ def format_request_list_item(request: dict) -> str:
     destination = request.get("destination") or request.get("country") or "без направления"
     budget = f"{_format_price(request.get('budget'))} ₽" if request.get("budget") else "не указан"
     travelers = request.get("travelers") or "-"
+    assignee = (
+        f"mgr={request.get('assigned_manager_vk_id')}"
+        if request.get("assigned_manager_vk_id")
+        else "mgr=free"
+    )
     return (
         f"#{request['id']} | {request_status_label(str(request.get('status') or ''))} | "
-        f"{destination} | бюджет {budget} | {travelers} чел. | vk={request['vk_id']}"
+        f"{destination} | бюджет {budget} | {travelers} чел. | vk={request['vk_id']} | {assignee}"
     )
 
 
@@ -178,6 +196,9 @@ def format_request_notification(
         f"Тип отдыха: {rest_text}\n"
         f"Нужен менеджер: {'Да' if manager_required else 'Нет'}\n"
         "Команда для ответа:\n"
+        "/request_assign\n"
+        f"{request_id}\n"
+        "или\n"
         "/reply_request\n"
         f"{request_id} | Здравствуйте! Подобрал варианты по вашему запросу."
     )

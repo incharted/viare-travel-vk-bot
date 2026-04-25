@@ -11,12 +11,18 @@ class TourSelectionState(BaseStateGroup):
     CONFIRMATION = "confirmation"
 
 
+class ClientState(BaseStateGroup):
+    FAVORITE_ADD = "favorite_add"
+    FAVORITE_REMOVE = "favorite_remove"
+
+
 class AdminState(BaseStateGroup):
     BROADCAST = "broadcast"
     REPLY_VK = "reply_vk"
     REPLY_REQUEST = "reply_request"
     REQUEST_CARD = "request_card"
     REQUEST_CLOSE = "request_close"
+    REQUEST_ASSIGN = "request_assign"
     CONTENT_EDIT = "content_edit"
     TOUR_ADD_NAME = "tour_add_name"
     TOUR_ADD_COUNTRY = "tour_add_country"
@@ -29,3 +35,8 @@ class AdminState(BaseStateGroup):
     TOUR_DISABLE = "tour_disable"
     TOUR_ENABLE = "tour_enable"
     TOUR_PRICE = "tour_price"
+    MANAGER_ADD = "manager_add"
+    MANAGER_REMOVE = "manager_remove"
+    OFFER_PDF = "offer_pdf"
+    REPLY_TEMPLATE = "reply_template"
+    USER_UNBLOCK = "user_unblock"

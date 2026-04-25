@@ -1,24 +1,46 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import random
+import re
 from pathlib import Path
 
 from vkbottle.bot import Bot, BotLabeler, Message
 
+from config import get_settings
 from keyboards.main_menu import get_main_menu_keyboard, get_staff_menu_keyboard
-from services.admin import add_log, get_stats
+from services.admin import add_log, get_sales_analytics, get_stats
+from services.assignment import get_manager_load_calendar
 from services.auth import get_staff_role, is_admin, is_staff
 from services.content import get_content_block, update_content_block
 from services.exports import export_requests_csv, export_requests_xlsx
+from services.pdf_offer import build_offer_pdf
 from services.requests import (
+    assign_request_manager,
     get_latest_request_by_vk_id,
-    get_next_request,
+    get_next_request_for_staff,
     get_request_by_id,
     list_requests,
     update_request_status,
 )
-from services.tours import create_tour, get_tour_by_id, list_tours_admin, set_tour_active, update_tour_price
-from services.users import list_users
+from services.tour_operator_api import fetch_external_offers
+from services.tours import (
+    create_tour,
+    find_cheapest_destination_tours,
+    find_tours,
+    find_tours_flexible,
+    get_tour_by_id,
+    list_tours_admin,
+    set_tour_active,
+    update_tour_price,
+)
+from services.users import (
+    list_managers,
+    list_users,
+    set_manager_role,
+    set_user_block,
+    touch_manager_assignment,
+    upsert_user,
+)
 from services.vk_media import upload_document
 from utils.formatting import format_request_card, format_request_list_item
 from utils.states import AdminState
@@ -31,6 +53,9 @@ PANEL_OPEN_TEXTS = {"/admin", "/staff"}
 USER_MENU_BUTTONS = {
     "подобрать тур",
     "все туры",
+    "мои заявки",
+    "мой статус",
+    "избранное",
     "faq",
     "контакты",
     "оплата и бронирование",
@@ -53,7 +78,11 @@ STAFF_ACTION_TEXTS = {
     "заявки",
     "следующая заявка",
     "карточка заявки",
+    "закрепить заявку",
     "ответ по заявке",
+    "шаблон ответа",
+    "шаблоны ответов",
+    "помощь по панели",
     "ответ по vk id",
     "закрыть заявку",
     "статистика",
@@ -68,13 +97,25 @@ STAFF_ACTION_TEXTS = {
     "в работе",
     "ждут клиента",
     "закрытые",
+    "менеджеры",
+    "добавить менеджера",
+    "убрать менеджера",
+    "как назначить менеджера",
+    "календарь менеджеров",
+    "разблокировать vk",
+    "pdf кп",
     "/requests",
     "/request",
     "/request_next",
     "/request_card",
+    "/request_assign",
     "/request_close",
     "/reply",
     "/reply_request",
+    "/templates",
+    "/reply_template",
+    "/manager_help",
+    "/admin_help",
     "/stats",
     "/users",
     "/requests_export",
@@ -84,6 +125,19 @@ STAFF_ACTION_TEXTS = {
     "/tour_enable",
     "/tour_price",
     "/broadcast",
+    "/managers",
+    "/manager_add",
+    "/manager_remove",
+    "/manager_howto",
+    "/manager_calendar",
+    "/unblock_user",
+    "/offer_pdf",
+}
+
+REPLY_TEMPLATES = {
+    1: "Здравствуйте! Получили вашу заявку, уже подбираем лучшие варианты и скоро пришлем подборку.",
+    2: "Спасибо за запрос! Уточните, пожалуйста, даты поездки (или месяц), чтобы подобрать точнее.",
+    3: "Подготовили 3 подходящих варианта по вашему запросу. Напишите, какой формат вам ближе, и закрепим бронь.",
 }
 
 
@@ -98,14 +152,26 @@ def _staff_keyboard(role: str | None) -> str:
 async def _ensure_staff(message: Message) -> bool:
     if await is_staff(message.from_id):
         return True
-    await message.answer("Эта команда доступна только менеджеру или администратору.", keyboard=get_main_menu_keyboard())
+    await message.answer(
+        "Эта команда доступна только менеджеру или администратору.\n"
+        f"Ваш VK ID: {message.from_id}\n"
+        "Проверьте роль командой /role.\n"
+        "Если роли нет, администратор должен добавить вас в MANAGER_IDS или назначить через /manager_add.",
+        keyboard=get_main_menu_keyboard(),
+    )
     return False
 
 
 async def _ensure_admin(message: Message) -> bool:
     if await is_admin(message.from_id):
         return True
-    await message.answer("Этот раздел доступен только администратору.", keyboard=get_main_menu_keyboard())
+    await message.answer(
+        "Этот раздел доступен только администратору.\n"
+        f"Ваш VK ID: {message.from_id}\n"
+        "Проверьте роль командой /role.\n"
+        "Чтобы получить доступ: добавьте этот ID в ADMIN_IDS в .env и перезапустите бота.",
+        keyboard=get_main_menu_keyboard(),
+    )
     return False
 
 
@@ -128,6 +194,59 @@ def _parse_reply_payload(text: str) -> tuple[int, str] | None:
     return int(parts[0]), parts[1].strip()
 
 
+def _parse_vk_id(text: str) -> int | None:
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    if clean.isdigit():
+        return int(clean)
+
+    # Support formats like id123456, vk.com/id123456 and messages with embedded ID.
+    match = re.search(r"(?:https?://)?(?:m\.)?vk\.com/id(\d+)", clean, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r"\bid(\d+)\b", clean, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r"\b(\d{5,12})\b", clean)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _parse_request_assign_payload(text: str) -> tuple[int, int | None] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if "|" in raw:
+        left, right = raw.split("|", 1)
+        left = left.strip()
+        right = right.strip()
+        if left.isdigit() and right.isdigit():
+            return int(left), int(right)
+        return None
+    if raw.isdigit():
+        return int(raw), None
+    return None
+
+
+def _request_assignee_vk_id(request: dict) -> int | None:
+    value = request.get("assigned_manager_vk_id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_request_owned_by_other_manager(request: dict, manager_vk_id: int) -> bool:
+    assignee = _request_assignee_vk_id(request)
+    return assignee is not None and assignee != manager_vk_id
+
+
 def _parse_tour_location(text: str) -> tuple[str | None, str | None, str | None]:
     raw = (text or "").strip()
     if not raw:
@@ -148,17 +267,18 @@ def _parse_tour_location(text: str) -> tuple[str | None, str | None, str | None]
         if destination:
             destination = " ".join(word.capitalize() for word in destination.split())
         return "domestic", country, destination
-
     return "abroad", country, country
 
 
-async def _send_text(bot: Bot, peer_id: int, text: str, attachment: str | None = None) -> None:
-    await bot.api.messages.send(
-        peer_id=peer_id,
-        message=text,
-        attachment=attachment,
-        random_id=random.randint(1, 2_000_000_000),
-    )
+def _requests_hint_lines() -> list[str]:
+    return [
+        "Что можно сделать дальше:",
+        "- Открыть карточку: /request_card",
+        "- Закрепить заявку: /request_assign",
+        "- Ответить клиенту: /reply_request",
+        "- Ответ по шаблону: /reply_template",
+        "- Взять следующую заявку: /request_next",
+    ]
 
 
 async def _send_manager_reply(bot: Bot, vk_id: int, text: str) -> None:
@@ -169,23 +289,19 @@ async def _send_manager_reply(bot: Bot, vk_id: int, text: str) -> None:
     )
 
 
-def _requests_hint_lines() -> list[str]:
-    return [
-        "Что можно сделать дальше:",
-        "- Открыть карточку: /request_card",
-        "- Ответить клиенту: /reply_request",
-        "- Взять следующую заявку: /request_next",
-    ]
-
-
 async def _show_staff_panel(message: Message) -> None:
     role = await get_staff_role(message.from_id)
     title = "Панель администратора" if role == "admin" else "Панель менеджера"
-    lines = [title, "", "Доступные действия: работа с заявками, ответы клиентам и быстрые фильтры."]
+    lines = [title, "", "Доступные действия: заявки, закрепление, ответы клиентам, шаблоны и карточки."]
     if role == "admin":
-        lines.append("Дополнительно доступны статистика, пользователи, выгрузка, управление турами и контентом.")
+        lines.append(
+            "Дополнительно: расширенная аналитика, пользователи, менеджеры, туры, PDF КП, контент и рассылка."
+        )
+        lines.append("Быстрая шпаргалка: /admin_help")
+    else:
+        lines.append("Быстрая шпаргалка: /manager_help")
     lines.append("")
-    lines.append("Нажмите кнопку ниже или используйте команду.")
+    lines.append("Нажмите кнопку ниже или используйте slash-команды.")
     await message.answer("\n".join(lines), keyboard=_staff_keyboard(role))
 
 
@@ -193,13 +309,41 @@ async def _show_filtered_requests(message: Message, status: str | None = None) -
     rows = await list_requests(limit=15, status=status)
     role = await get_staff_role(message.from_id)
     if not rows:
-        await message.answer("Подходящих заявок пока нет.", keyboard=_staff_keyboard(role))
+        await message.answer(
+            "Подходящих заявок пока нет.\n"
+            "Подсказка: проверьте другой фильтр или нажмите /request_next.",
+            keyboard=_staff_keyboard(role),
+        )
         return
 
     lines = ["Список заявок:", ""]
     lines.extend(format_request_list_item(row) for row in rows)
     lines.extend(["", *_requests_hint_lines()])
     await message.answer("\n".join(lines), keyboard=_staff_keyboard(role))
+
+
+async def _show_tours_admin_list(message: Message) -> None:
+    tours = await list_tours_admin(limit=25)
+    role = await get_staff_role(message.from_id)
+    if not tours:
+        await message.answer("Туров пока нет.", keyboard=_staff_keyboard(role))
+        return
+
+    lines = ["Туры в системе:", ""]
+    for tour in tours:
+        status = "активен" if int(tour.get("is_active") or 0) == 1 else "выключен"
+        destination = tour.get("destination") or tour.get("country") or "без направления"
+        photo_mark = "есть фото" if tour.get("photo_url") else "без фото"
+        lines.append(
+            f"#{tour['id']} | {tour['name']} | {destination} | "
+            f"{tour['price_per_person']} ₽/чел. | {status} | {photo_mark}"
+        )
+    lines.extend(["", "Команды: /tour_add /tour_disable /tour_enable /tour_price"])
+    await message.answer("\n".join(lines), keyboard=_staff_keyboard(role))
+
+
+async def _set_state(bot: Bot, peer_id: int, state: str, payload: dict | None = None) -> None:
+    await bot.state_dispenser.set(peer_id, state, **(payload or {}))
 
 
 async def _handle_state_escape(bot: Bot, message: Message) -> bool:
@@ -238,47 +382,168 @@ async def _handle_state_escape(bot: Bot, message: Message) -> bool:
     return False
 
 
-async def _set_state(bot: Bot, peer_id: int, state: str, payload: dict | None = None) -> None:
-    await bot.state_dispenser.set(peer_id, state, **(payload or {}))
+async def _resolve_request_offers(request: dict) -> tuple[list[dict], str]:
+    rest_type = str(request.get("rest_type") or "any")
+    if rest_type == "любой":
+        rest_type = "any"
+    budget = int(request.get("budget") or 0)
+    travelers = int(request.get("travelers") or 1)
+    start_date = str(request.get("start_date") or "")
+    end_date = str(request.get("end_date") or "")
+    travel_scope = str(request.get("travel_scope") or "abroad")
+    country = str(request.get("country") or "")
+    destination = request.get("destination")
+    if not (country and start_date and end_date and travelers > 0):
+        return [], "Недостаточно данных для автоподбора"
 
-
-async def _show_tours_admin_list(message: Message) -> None:
-    tours = await list_tours_admin(limit=25)
-    role = await get_staff_role(message.from_id)
-    if not tours:
-        await message.answer("Туров пока нет.", keyboard=_staff_keyboard(role))
-        return
-
-    lines = ["Туры в системе:", ""]
-    for tour in tours:
-        status = "активен" if int(tour.get("is_active") or 0) == 1 else "выключен"
-        destination = tour.get("destination") or tour.get("country") or "без направления"
-        photo_mark = "есть фото" if tour.get("photo_url") else "без фото"
-        lines.append(
-            f"#{tour['id']} | {tour['name']} | {destination} | "
-            f"{tour['price_per_person']} ₽/чел. | {status} | {photo_mark}"
-        )
-
-    lines.extend(
-        [
-            "",
-            "Команды:",
-            "/tour_add",
-            "/tour_disable",
-            "/tour_enable",
-            "/tour_price",
-        ]
+    exact = await find_tours(
+        travel_scope=travel_scope,
+        country=country,
+        destination=destination,
+        budget=budget if budget > 0 else 20_000_000,
+        travelers=travelers,
+        start_date=start_date,
+        end_date=end_date,
+        rest_type=rest_type,
+        limit=3,
     )
-    await message.answer("\n".join(lines), keyboard=_staff_keyboard(role))
+    if exact:
+        return exact, "Точные варианты из базы"
+
+    flexible = await find_tours_flexible(
+        travel_scope=travel_scope,
+        country=country,
+        destination=destination,
+        budget=budget if budget > 0 else 20_000_000,
+        travelers=travelers,
+        start_date=start_date,
+        end_date=end_date,
+        rest_type=rest_type,
+        limit=3,
+    )
+    if flexible:
+        return flexible, "Близкие варианты из базы"
+
+    cheapest = await find_cheapest_destination_tours(
+        travel_scope=travel_scope,
+        country=country,
+        destination=destination,
+        travelers=travelers,
+        limit=3,
+    )
+    if cheapest:
+        return cheapest, "Минимальные цены по направлению"
+
+    if travel_scope == "abroad":
+        external = await fetch_external_offers(
+            country=country,
+            budget=budget if budget > 0 else 20_000_000,
+            travelers=travelers,
+            start_date=start_date,
+            end_date=end_date,
+            rest_type=rest_type,
+        )
+        if external:
+            return external[:3], "Внешние варианты партнера"
+    return [], "Варианты не найдены"
+
+
+def _templates_help_text() -> str:
+    lines = ["Шаблоны ответов менеджера:"]
+    for idx, text in REPLY_TEMPLATES.items():
+        lines.append(f"{idx}. {text}")
+    lines.extend(["", "Использование: /reply_template", "Формат: ID заявки | номер шаблона"])
+    return "\n".join(lines)
+
+
+def _manager_help_text() -> str:
+    return (
+        "Подсказка менеджера:\n"
+        "1. Взять заявку: /request_next\n"
+        "2. Закрепить вручную: /request_assign\n"
+        "3. Открыть карточку: /request_card\n"
+        "4. Ответить клиенту: /reply_request\n"
+        "5. Быстрый шаблон: /reply_template\n"
+        "6. Закрыть заявку: /request_close\n"
+        "7. Посмотреть загрузку команды: /manager_calendar\n\n"
+        "Форматы ввода:\n"
+        "- /request_assign -> ID заявки\n"
+        "- /reply_request -> ID заявки | текст\n"
+        "- /reply_template -> ID заявки | номер шаблона\n\n"
+        "Служебные команды:\n"
+        "- Отмена текущего ввода: отмена\n"
+        "- Выход из панели: /exit_panel"
+    )
+
+
+def _admin_help_text() -> str:
+    return (
+        "Подсказка администратора:\n"
+        "Заявки и команда:\n"
+        "- /requests, /request_next, /request_assign, /request_card, /request_close\n"
+        "- /reply_request, /reply_template, /templates\n\n"
+        "Управление:\n"
+        "- Менеджеры: /managers, /manager_add, /manager_remove, /manager_calendar\n"
+        "- Быстрый гайд по менеджерам: /manager_howto\n"
+        "- Туры: /tour_list, /tour_add, /tour_disable, /tour_enable, /tour_price\n"
+        "- Контент: кнопки FAQ/Контакты/Оплата текст\n"
+        "- Рассылки и экспорт: /broadcast, /requests_export\n"
+        "- Антиспам: /unblock_user\n"
+        "- Аналитика: /stats\n\n"
+        "Форматы:\n"
+        "- /request_assign -> ID заявки | VK ID менеджера\n"
+        "- /reply_request -> ID заявки | текст\n"
+        "- /tour_price -> ID тура | новая цена\n"
+        "- /unblock_user -> VK ID"
+    )
 
 
 def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
-    @labeler.message(text=["/admin", "/staff"])
+    @labeler.message(text=["/admin", "/staff", "admin", "staff", "панель"])
     async def open_staff_panel(message: Message) -> None:
         if not await _ensure_staff(message):
             return
         await bot.state_dispenser.delete(message.peer_id)
+        role = await get_staff_role(message.from_id)
+        if (message.text or "").strip().lower() == "/admin" and role != "admin":
+            await message.answer(
+                "Команда /admin доступна только администратору.\n"
+                "У вас роль менеджера, поэтому открываю панель менеджера.",
+                keyboard=_staff_keyboard(role),
+            )
         await _show_staff_panel(message)
+
+    @labeler.message(text=["Помощь по панели", "/manager_help"])
+    async def manager_help_handler(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        role = await get_staff_role(message.from_id)
+        text = _admin_help_text() if role == "admin" else _manager_help_text()
+        await message.answer(text, keyboard=_staff_keyboard(role))
+
+    @labeler.message(text="/admin_help")
+    async def admin_help_handler(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        await message.answer(_admin_help_text(), keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+
+    @labeler.message(text=["Как назначить менеджера", "/manager_howto", "/admin_start"])
+    async def manager_howto_handler(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        await message.answer(
+            "Как назначать менеджеров (быстро):\n"
+            "1. Нажмите «Добавить менеджера» или отправьте /manager_add\n"
+            "2. Введите VK ID менеджера (поддерживаются форматы 123456789, id123456789, https://vk.com/id123456789)\n"
+            "3. Проверьте список через /managers\n\n"
+            "Как убрать менеджера:\n"
+            "1. Нажмите «Убрать менеджера» или отправьте /manager_remove\n"
+            "2. Введите VK ID\n\n"
+            "Если права не применились:\n"
+            "- Проверьте роль командой /role\n"
+            "- Если ID указан в MANAGER_IDS в .env, права подтянутся после перезапуска",
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
 
     @labeler.message(text=["Выйти из панели", "/exit_panel"])
     async def exit_staff_panel(message: Message) -> None:
@@ -304,34 +569,53 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def next_request_handler(message: Message) -> None:
         if not await _ensure_staff(message):
             return
-
-        request = await get_next_request(("new", "in_progress", "waiting_client"))
         role = await get_staff_role(message.from_id)
+        is_admin_role = role == "admin"
+        request = await get_next_request_for_staff(
+            message.from_id,
+            is_admin_role=is_admin_role,
+            statuses=("new", "in_progress", "waiting_client"),
+        )
         if not request:
             await message.answer("Активных заявок сейчас нет.", keyboard=_staff_keyboard(role))
             return
 
+        updates: list[str] = []
+        if not is_admin_role:
+            assignee = _request_assignee_vk_id(request)
+            if assignee is None:
+                await assign_request_manager(int(request["id"]), message.from_id)
+                await touch_manager_assignment(message.from_id)
+                request["assigned_manager_vk_id"] = message.from_id
+                updates.append(f"Заявка закреплена за вами (vk={message.from_id}).")
+
         if request.get("status") == "new":
             await update_request_status(int(request["id"]), "in_progress")
             request["status"] = "in_progress"
+            updates.append("Статус переведен в «В работе».")
 
-        await message.answer(format_request_card(request), keyboard=_staff_keyboard(role))
+        card_text = format_request_card(request)
+        if updates:
+            card_text += "\n\n" + "\n".join(updates)
+        card_text += (
+            "\n\nДальше можно:\n"
+            "- ответить клиенту: /reply_request\n"
+            "- отправить шаблон: /reply_template\n"
+            "- закрыть заявку: /request_close"
+        )
+        await message.answer(card_text, keyboard=_staff_keyboard(role))
 
     @labeler.message(text=["/request_card", "Карточка заявки"])
     async def request_card_prompt(message: Message) -> None:
         if not await _ensure_staff(message):
             return
         await _set_state(bot, message.peer_id, AdminState.REQUEST_CARD)
-        await message.answer(
-            "Введите ID заявки.\nПример: 25\n\nДля выхода напишите «Отмена».",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите ID заявки. Пример: 25", keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
 
     @labeler.message(state=AdminState.REQUEST_CARD)
     async def request_card_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         text = (message.text or "").strip()
         if not text.isdigit():
             await message.answer("Нужен ID заявки. Пример: 25")
@@ -339,27 +623,101 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
 
         request = await get_request_by_id(int(text))
         if not request:
-            await message.answer("Заявка с таким ID не найдена. Попробуйте еще раз.")
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+        await bot.state_dispenser.delete(message.peer_id)
+        role = await get_staff_role(message.from_id)
+        await message.answer(
+            format_request_card(request)
+            + "\n\nПодсказка: /request_assign закрепить, /reply_request ответить, /request_close закрыть.",
+            keyboard=_staff_keyboard(role),
+        )
+
+    @labeler.message(text=["/request_assign", "Закрепить заявку"])
+    async def request_assign_prompt(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        role = await get_staff_role(message.from_id)
+        await _set_state(bot, message.peer_id, AdminState.REQUEST_ASSIGN)
+        if role == "admin":
+            await message.answer(
+                "Введите ID заявки.\n"
+                "Можно назначить конкретного менеджера: ID заявки | VK ID менеджера\n"
+            "Пример: 25 | 123456789",
+                keyboard=_staff_keyboard(role),
+            )
+            return
+        await message.answer(
+            "Введите ID заявки, чтобы закрепить ее за собой.\nПример: 25",
+            keyboard=_staff_keyboard(role),
+        )
+
+    @labeler.message(state=AdminState.REQUEST_ASSIGN)
+    async def request_assign_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        parsed = _parse_request_assign_payload(message.text or "")
+        if not parsed:
+            await message.answer("Нужен формат: ID заявки или ID заявки | VK ID менеджера")
             return
 
+        role = await get_staff_role(message.from_id)
+        is_admin_role = role == "admin"
+        request_id, target_manager_vk_id = parsed
+        target_manager_vk_id = target_manager_vk_id or message.from_id
+
+        if not is_admin_role and target_manager_vk_id != message.from_id:
+            await message.answer("Менеджер может закреплять заявки только за собой.")
+            return
+
+        request = await get_request_by_id(request_id)
+        if not request:
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+
+        current_assignee = _request_assignee_vk_id(request)
+        if not is_admin_role and _is_request_owned_by_other_manager(request, message.from_id):
+            await message.answer(
+                f"Заявка уже закреплена за другим менеджером (vk={current_assignee}).\n"
+                "Обратитесь к администратору для переназначения."
+            )
+            return
+
+        if target_manager_vk_id != message.from_id and not await is_staff(target_manager_vk_id):
+            await message.answer(
+                "Этот VK ID пока не имеет прав менеджера.\n"
+                "Сначала назначьте его менеджером через /manager_add."
+            )
+            return
+
+        await assign_request_manager(request_id, target_manager_vk_id)
+        await touch_manager_assignment(target_manager_vk_id)
+        if request.get("status") == "new":
+            await update_request_status(request_id, "in_progress")
+
         await bot.state_dispenser.delete(message.peer_id)
-        await message.answer(format_request_card(request), keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+        await add_log(
+            None,
+            "request_assign",
+            f"request_id={request_id}; assigned_to={target_manager_vk_id}; by={message.from_id}",
+        )
+        await message.answer(
+            f"Процесс выполнен. Заявка #{request_id} закреплена за vk={target_manager_vk_id}.\n"
+            "Следующий шаг: /reply_request или /reply_template для ответа клиенту.",
+            keyboard=_staff_keyboard(role),
+        )
 
     @labeler.message(text=["/request_close", "Закрыть заявку"])
     async def request_close_prompt(message: Message) -> None:
         if not await _ensure_staff(message):
             return
         await _set_state(bot, message.peer_id, AdminState.REQUEST_CLOSE)
-        await message.answer(
-            "Введите ID заявки, которую нужно закрыть.\nПример: 25",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите ID заявки, которую нужно закрыть. Пример: 25")
 
     @labeler.message(state=AdminState.REQUEST_CLOSE)
     async def request_close_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         text = (message.text or "").strip()
         if not text.isdigit():
             await message.answer("Нужен ID заявки. Пример: 25")
@@ -371,11 +729,19 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
             await message.answer("Заявка с таким ID не найдена.")
             return
 
+        role = await get_staff_role(message.from_id)
+        if role != "admin" and _is_request_owned_by_other_manager(request, message.from_id):
+            await message.answer(
+                f"Эта заявка закреплена за другим менеджером (vk={request.get('assigned_manager_vk_id')})."
+            )
+            return
+
         await update_request_status(request_id, "closed")
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
-            f"Процесс выполнен. Заявка #{request_id} закрыта.",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+            f"Процесс выполнен. Заявка #{request_id} закрыта.\n"
+            "Можно взять следующую: /request_next",
+            keyboard=_staff_keyboard(role),
         )
 
     @labeler.message(text=["/reply", "Ответ по VK ID"])
@@ -383,35 +749,39 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_staff(message):
             return
         await _set_state(bot, message.peer_id, AdminState.REPLY_VK)
-        await message.answer(
-            "Введите VK ID и текст ответа.\nПример: 577900016 | Здравствуйте! Нашел подходящие варианты на ваши даты.",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите VK ID и текст ответа. Пример: 123456789 | Здравствуйте! Подобрали варианты.")
 
     @labeler.message(state=AdminState.REPLY_VK)
     async def reply_vk_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         parsed = _parse_reply_payload(message.text or "")
         if not parsed:
-            await message.answer(
-                "Нужен формат: VK ID | текст ответа\nПример: 577900016 | Здравствуйте! Нашел подходящие варианты."
-            )
+            await message.answer("Нужен формат: VK ID | текст ответа")
             return
 
         vk_id, reply_text = parsed
+        role = await get_staff_role(message.from_id)
+        latest_request = await get_latest_request_by_vk_id(vk_id)
+        if latest_request and role != "admin" and _is_request_owned_by_other_manager(latest_request, message.from_id):
+            await message.answer(
+                f"Последняя заявка этого клиента закреплена за другим менеджером (vk={latest_request.get('assigned_manager_vk_id')})."
+            )
+            return
+
         await bot.state_dispenser.delete(message.peer_id)
         await _send_manager_reply(bot, vk_id, reply_text)
-
-        latest_request = await get_latest_request_by_vk_id(vk_id)
         if latest_request and latest_request.get("status") != "closed":
+            if role != "admin" and not _request_assignee_vk_id(latest_request):
+                await assign_request_manager(int(latest_request["id"]), message.from_id)
+                await touch_manager_assignment(message.from_id)
             await update_request_status(int(latest_request["id"]), "waiting_client")
 
         await add_log(None, "manager_reply_vk", f"Reply sent to vk_id={vk_id}")
         await message.answer(
-            "Ответ отправлен клиенту. Последняя заявка переведена в статус «Ждет клиента».",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+            "Ответ отправлен клиенту. Статус заявки обновлен на «Ждет клиента».\n"
+            "Дальше: /request_next (следующая) или /request_close (закрыть текущую).",
+            keyboard=_staff_keyboard(role),
         )
 
     @labeler.message(text=["/reply_request", "Ответ по заявке"])
@@ -419,21 +789,15 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_staff(message):
             return
         await _set_state(bot, message.peer_id, AdminState.REPLY_REQUEST)
-        await message.answer(
-            "Введите ID заявки и текст ответа.\nПример: 25 | Здравствуйте! Нашел подходящие варианты на ваши даты.",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите ID заявки и текст ответа. Пример: 25 | Здравствуйте! Подобрали варианты.")
 
     @labeler.message(state=AdminState.REPLY_REQUEST)
     async def reply_request_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         parsed = _parse_reply_payload(message.text or "")
         if not parsed:
-            await message.answer(
-                "Нужен формат: ID заявки | текст ответа\nПример: 25 | Здравствуйте! Нашел подходящие варианты."
-            )
+            await message.answer("Нужен формат: ID заявки | текст ответа")
             return
 
         request_id, reply_text = parsed
@@ -442,13 +806,88 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
             await message.answer("Заявка с таким ID не найдена.")
             return
 
+        role = await get_staff_role(message.from_id)
+        if role != "admin" and _is_request_owned_by_other_manager(request, message.from_id):
+            await message.answer(
+                f"Эта заявка закреплена за другим менеджером (vk={request.get('assigned_manager_vk_id')})."
+            )
+            return
+
         await bot.state_dispenser.delete(message.peer_id)
         await _send_manager_reply(bot, int(request["vk_id"]), reply_text)
+        if role != "admin" and not _request_assignee_vk_id(request):
+            await assign_request_manager(request_id, message.from_id)
+            await touch_manager_assignment(message.from_id)
         await update_request_status(request_id, "waiting_client")
         await add_log(None, "manager_reply_request", f"Reply sent for request_id={request_id}")
         await message.answer(
-            f"Ответ по заявке #{request_id} отправлен. Статус обновлен на «Ждет клиента».",
+            f"Ответ по заявке #{request_id} отправлен. Статус обновлен на «Ждет клиента».\n"
+            "Можно отправить еще один ответ или закрыть заявку через /request_close.",
+            keyboard=_staff_keyboard(role),
+        )
+
+    @labeler.message(text=["/templates", "Шаблоны ответов"])
+    async def templates_list_handler(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        await message.answer(_templates_help_text(), keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+
+    @labeler.message(text=["/reply_template", "Шаблон ответа"])
+    async def reply_template_prompt(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        await _set_state(bot, message.peer_id, AdminState.REPLY_TEMPLATE)
+        await message.answer(
+            _templates_help_text() + "\n\nВведите: ID заявки | номер шаблона\nПример: 25 | 1",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
+
+    @labeler.message(state=AdminState.REPLY_TEMPLATE)
+    async def reply_template_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        parsed = _parse_reply_payload(message.text or "")
+        if not parsed:
+            await message.answer("Нужен формат: ID заявки | номер шаблона")
+            return
+
+        request_id, template_raw = parsed
+        if not str(template_raw).isdigit():
+            await message.answer("Номер шаблона должен быть числом. Пример: 1")
+            return
+        template_number = int(str(template_raw))
+        template_text = REPLY_TEMPLATES.get(template_number)
+        if not template_text:
+            await message.answer("Такого шаблона нет. Доступные: 1, 2, 3")
+            return
+
+        request = await get_request_by_id(request_id)
+        if not request:
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+
+        role = await get_staff_role(message.from_id)
+        if role != "admin" and _is_request_owned_by_other_manager(request, message.from_id):
+            await message.answer(
+                f"Эта заявка закреплена за другим менеджером (vk={request.get('assigned_manager_vk_id')})."
+            )
+            return
+
+        await bot.state_dispenser.delete(message.peer_id)
+        await _send_manager_reply(bot, int(request["vk_id"]), template_text)
+        if role != "admin" and not _request_assignee_vk_id(request):
+            await assign_request_manager(request_id, message.from_id)
+            await touch_manager_assignment(message.from_id)
+        await update_request_status(request_id, "waiting_client")
+        await add_log(
+            None,
+            "manager_reply_template",
+            f"request_id={request_id}; template={template_number}; by={message.from_id}",
+        )
+        await message.answer(
+            f"Шаблон #{template_number} отправлен клиенту по заявке #{request_id}.\n"
+            "Если клиент подтвердил, закройте заявку: /request_close",
+            keyboard=_staff_keyboard(role),
         )
 
     @labeler.message(text=["/stats", "Статистика"])
@@ -456,12 +895,69 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_admin(message):
             return
         stats = await get_stats()
+        analytics = await get_sales_analytics(top_limit=5)
+        top_dest_lines = [
+            f"- {row['destination']}: {row['requests_count']}"
+            for row in analytics.get("top_destinations", [])
+        ] or ["- пока нет данных"]
+        manager_load_lines = [
+            f"- vk={row['manager_vk_id']}: {row['requests_count']}"
+            for row in analytics.get("manager_load", [])
+        ] or ["- пока нет закрепленных заявок"]
+        avg_budget_text = f"{analytics['avg_budget']:,}".replace(",", " ")
         await message.answer(
             "Статистика проекта:\n"
             f"- Пользователи: {stats['users']}\n"
             f"- Заявки: {stats['requests']}\n"
             f"- Активные туры: {stats['tours']}\n"
-            f"- Логи: {stats['logs']}",
+            f"- Логи: {stats['logs']}\n\n"
+            "Воронка заявок:\n"
+            f"- Новые: {analytics['new_requests']}\n"
+            f"- В работе: {analytics['in_progress_requests']}\n"
+            f"- Ждут клиента: {analytics['waiting_client_requests']}\n"
+            f"- Закрытые: {analytics['closed_requests']}\n"
+            f"- Конверсия в закрытые: {analytics['conversion_closed_pct']}%\n"
+            f"- Средний бюджет: {avg_budget_text} ₽\n\n"
+            + "Топ направлений:\n"
+            + "\n".join(top_dest_lines)
+            + "\n\nНагрузка по менеджерам:\n"
+            + "\n".join(manager_load_lines),
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
+
+    @labeler.message(text=["/manager_calendar", "Календарь менеджеров"])
+    async def manager_calendar_handler(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        calendar = await get_manager_load_calendar()
+        managers = calendar.get("managers", [])
+        if not managers:
+            await message.answer(
+                "Свободных менеджеров для автоназначения пока не найдено.\n"
+                "Назначьте менеджера через /manager_add.",
+                keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+            )
+            return
+
+        lines = [
+            "Календарь загрузки менеджеров:",
+            "",
+            f"Неразобранных активных заявок: {calendar.get('unassigned_active', 0)}",
+            "",
+        ]
+        for row in managers:
+            lines.append(
+                f"vk={row['vk_id']} | активных: {row['active_requests']} | "
+                f"последнее назначение: {row.get('last_assigned_at') or '-'}"
+            )
+        lines.extend(
+            [
+                "",
+                "Подсказка: для ручного перераспределения используйте /request_assign.",
+            ]
+        )
+        await message.answer(
+            "\n".join(lines),
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )
 
@@ -469,7 +965,7 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def users_handler(message: Message) -> None:
         if not await _ensure_admin(message):
             return
-        rows = await list_users(limit=20)
+        rows = await list_users(limit=30)
         if not rows:
             await message.answer("Пользователей пока нет.", keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
             return
@@ -482,9 +978,187 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
             if int(row.get("is_manager") or 0) == 1 and "админ" not in role_parts:
                 role_parts.append("менеджер")
             role_text = ", ".join(role_parts) if role_parts else "клиент"
-            lines.append(f"#{row['id']} | vk={row['vk_id']} | {role_text} | {row['created_at']}")
-
+            block_text = "заблокирован" if int(row.get("is_blocked") or 0) == 1 else "активен"
+            strikes_text = int(row.get("spam_strikes") or 0)
+            lines.append(
+                f"#{row['id']} | vk={row['vk_id']} | {role_text} | {block_text} | "
+                f"strikes={strikes_text} | {row['created_at']}"
+            )
         await message.answer("\n".join(lines), keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+
+    @labeler.message(text=["/managers", "Менеджеры"])
+    async def managers_handler(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        rows = await list_managers(limit=100)
+        settings = get_settings()
+        if not rows and not settings.manager_ids:
+            await message.answer("Назначенных менеджеров пока нет.", keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+            return
+
+        lines = ["Менеджеры и админы:", ""]
+        if settings.manager_ids:
+            env_ids = ", ".join(str(vk_id) for vk_id in sorted(settings.manager_ids))
+            lines.append(f"Из .env (MANAGER_IDS): {env_ids}")
+            lines.append("")
+
+        for row in rows:
+            tags: list[str] = []
+            if int(row.get("is_admin") or 0) == 1:
+                tags.append("админ")
+            if int(row.get("is_manager") or 0) == 1:
+                tags.append("менеджер")
+            if int(row.get("is_blocked") or 0) == 1:
+                tags.append("заблокирован")
+            lines.append(
+                f"vk={row['vk_id']} | {', '.join(tags)} | "
+                f"последнее назначение: {row.get('last_assigned_at') or '-'} | updated: {row.get('updated_at') or '-'}"
+            )
+        lines.extend(["", "Команды: /manager_add /manager_remove /manager_calendar /unblock_user"])
+        await message.answer("\n".join(lines), keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
+
+    @labeler.message(text=["/manager_add", "Добавить менеджера"])
+    async def manager_add_prompt(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        await _set_state(bot, message.peer_id, AdminState.MANAGER_ADD)
+        await message.answer("Введите VK ID пользователя, которого нужно назначить менеджером. Пример: 123456789")
+
+    @labeler.message(state=AdminState.MANAGER_ADD)
+    async def manager_add_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        vk_id = _parse_vk_id(message.text or "")
+        if vk_id is None:
+            await message.answer("Нужен числовой VK ID. Пример: 123456789")
+            return
+
+        await upsert_user(vk_id, is_manager=True)
+        await bot.state_dispenser.delete(message.peer_id)
+        await add_log(None, "manager_add", f"Assigned manager vk_id={vk_id}")
+        await message.answer(
+            f"Процесс выполнен. Пользователь vk={vk_id} назначен менеджером.",
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
+
+    @labeler.message(text=["/manager_remove", "Убрать менеджера"])
+    async def manager_remove_prompt(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        await _set_state(bot, message.peer_id, AdminState.MANAGER_REMOVE)
+        await message.answer("Введите VK ID пользователя, у которого нужно убрать роль менеджера.")
+
+    @labeler.message(state=AdminState.MANAGER_REMOVE)
+    async def manager_remove_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        vk_id = _parse_vk_id(message.text or "")
+        if vk_id is None:
+            await message.answer("Нужен числовой VK ID. Пример: 123456789")
+            return
+
+        await set_manager_role(vk_id, False)
+        settings = get_settings()
+        await bot.state_dispenser.delete(message.peer_id)
+        if vk_id in settings.manager_ids:
+            warning = (
+                "\nВнимание: этот ID указан в MANAGER_IDS в .env, "
+                "поэтому доступ менеджера останется до изменения .env и перезапуска."
+            )
+        else:
+            warning = ""
+        await add_log(None, "manager_remove", f"Removed manager vk_id={vk_id}")
+        await message.answer(
+            f"Процесс выполнен. Роль менеджера для vk={vk_id} убрана.{warning}",
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
+
+    @labeler.message(text=["/unblock_user", "Разблокировать VK"])
+    async def unblock_user_prompt(message: Message) -> None:
+        if not await _ensure_admin(message):
+            return
+        await _set_state(bot, message.peer_id, AdminState.USER_UNBLOCK)
+        await message.answer("Введите VK ID пользователя, которого нужно разблокировать. Пример: 123456789")
+
+    @labeler.message(state=AdminState.USER_UNBLOCK)
+    async def unblock_user_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        vk_id = _parse_vk_id(message.text or "")
+        if vk_id is None:
+            await message.answer("Нужен числовой VK ID. Пример: 123456789")
+            return
+
+        await upsert_user(vk_id)
+        await set_user_block(vk_id, False)
+        await bot.state_dispenser.delete(message.peer_id)
+        await add_log(None, "user_unblock", f"Unblocked vk_id={vk_id}")
+        await message.answer(
+            f"Процесс выполнен. Пользователь vk={vk_id} разблокирован.",
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
+
+    @labeler.message(text=["/offer_pdf", "PDF КП"])
+    async def offer_pdf_prompt(message: Message) -> None:
+        if not await _ensure_staff(message):
+            return
+        await _set_state(bot, message.peer_id, AdminState.OFFER_PDF)
+        await message.answer("Введите ID заявки для формирования PDF коммерческого предложения. Пример: 25")
+
+    @labeler.message(state=AdminState.OFFER_PDF)
+    async def offer_pdf_state(message: Message) -> None:
+        if await _handle_state_escape(bot, message):
+            return
+        text = (message.text or "").strip()
+        if not text.isdigit():
+            await message.answer("Нужен ID заявки. Пример: 25")
+            return
+
+        request = await get_request_by_id(int(text))
+        if not request:
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+
+        offers, source_label = await _resolve_request_offers(request)
+        if not offers:
+            await message.answer(f"Не удалось подготовить варианты для PDF. Причина: {source_label}")
+            return
+
+        try:
+            pdf_path = build_offer_pdf(request, offers)
+        except Exception as err:  # noqa: BLE001
+            await message.answer(
+                "Не удалось сформировать PDF. Установите зависимость reportlab и повторите.\n"
+                f"Техническая причина: {err}"
+            )
+            return
+
+        attachment = await upload_document(Path(pdf_path), pdf_path.name)
+        if not attachment:
+            await message.answer("PDF сформирован, но загрузить его в VK не удалось.")
+            return
+
+        await bot.state_dispenser.delete(message.peer_id)
+        await bot.api.messages.send(
+            peer_id=message.peer_id,
+            message=f"PDF КП готово по заявке #{request['id']} ({source_label}).",
+            attachment=attachment,
+            random_id=random.randint(1, 2_000_000_000),
+        )
+        await bot.api.messages.send(
+            user_id=int(request["vk_id"]),
+            message="Подготовили для вас коммерческое предложение в PDF. Посмотрите варианты и напишите, что ближе.",
+            attachment=attachment,
+            random_id=random.randint(1, 2_000_000_000),
+        )
+        if request.get("status") != "closed":
+            await update_request_status(int(request["id"]), "waiting_client")
+        await add_log(None, "offer_pdf", f"Generated and sent offer pdf for request_id={request['id']}")
+        await message.answer(
+            "Готово. PDF отправлен в этот чат и клиенту.\n"
+            "Подсказка: можете отправить follow-up через /reply_request.",
+            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
+        )
 
     @labeler.message(text=["/requests_export", "Выгрузка заявок"])
     async def export_requests_handler(message: Message) -> None:
@@ -503,11 +1177,11 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
             if xlsx_attachment:
                 attachments.append(xlsx_attachment)
 
-        await _send_text(
-            bot,
-            message.peer_id,
-            "Процесс выполнен. Файлы выгрузки подготовлены.",
+        await bot.api.messages.send(
+            peer_id=message.peer_id,
+            message="Процесс выполнен. Файлы выгрузки подготовлены.\nПодсказка: для аналитики в чате используйте /stats.",
             attachment=",".join(attachments) if attachments else None,
+            random_id=random.randint(1, 2_000_000_000),
         )
 
     @labeler.message(text=["/tour_list", "Туры админ"])
@@ -521,10 +1195,7 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_admin(message):
             return
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_NAME)
-        await message.answer(
-            "Введите название тура.\nПример: Сочи Weekend",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите название тура. Пример: Сочи Weekend", keyboard=_staff_keyboard(await get_staff_role(message.from_id)))
 
     @labeler.message(state=AdminState.TOUR_ADD_NAME)
     async def tour_add_name_state(message: Message) -> None:
@@ -535,31 +1206,21 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
             await message.answer("Название слишком короткое. Попробуйте еще раз.")
             return
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_COUNTRY, {"name": name})
-        await message.answer(
-            "Введите страну.\nДля России можно так: Россия | Сочи\nДля зарубежья: Турция",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите страну. Для России можно так: Россия | Сочи. Для зарубежья: Турция")
 
     @labeler.message(state=AdminState.TOUR_ADD_COUNTRY)
     async def tour_add_country_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         travel_scope, country, destination = _parse_tour_location(message.text or "")
         if not country or not travel_scope:
             await message.answer("Не понял направление. Пример: Россия | Сочи или Турция")
             return
 
         payload = dict(message.state_peer.payload or {})
-        payload.update(
-            {
-                "travel_scope": travel_scope,
-                "country": country,
-                "destination": destination,
-            }
-        )
+        payload.update({"travel_scope": travel_scope, "country": country, "destination": destination})
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_PRICE, payload)
-        await message.answer("Введите цену за человека в рублях.\nПример: 95000")
+        await message.answer("Введите цену за человека в рублях. Пример: 95000")
 
     @labeler.message(state=AdminState.TOUR_ADD_PRICE)
     async def tour_add_price_state(message: Message) -> None:
@@ -569,11 +1230,10 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not price:
             await message.answer("Некорректная цена. Пример: 95000")
             return
-
         payload = dict(message.state_peer.payload or {})
         payload["price_per_person"] = price
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_DAYS, payload)
-        await message.answer("Введите длительность тура в днях.\nПример: 7")
+        await message.answer("Введите длительность тура в днях. Пример: 7")
 
     @labeler.message(state=AdminState.TOUR_ADD_DAYS)
     async def tour_add_days_state(message: Message) -> None:
@@ -583,44 +1243,36 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not text.isdigit():
             await message.answer("Нужно число дней. Пример: 7")
             return
-
         days = int(text)
         if days < 2 or days > 30:
             await message.answer("Длительность должна быть от 2 до 30 дней.")
             return
-
         payload = dict(message.state_peer.payload or {})
         payload["duration_days"] = days
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_REST, payload)
-        await message.answer(
-            "Введите тип отдыха.\nДоступно: пляжный, экскурсионный, активный, семейный, горнолыжный, оздоровительный"
-        )
+        await message.answer("Введите тип отдыха. Пример: семейный")
 
     @labeler.message(state=AdminState.TOUR_ADD_REST)
     async def tour_add_rest_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         rest_type = normalize_rest_type(message.text or "")
         if not rest_type or rest_type == "any":
             await message.answer("Нужен конкретный тип отдыха. Пример: семейный")
             return
-
         payload = dict(message.state_peer.payload or {})
         payload["rest_type"] = rest_type
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_DATES, payload)
-        await message.answer("Введите диапазон доступности.\nПример: 01.06.2026 - 30.09.2026")
+        await message.answer("Введите диапазон доступности. Пример: 01.06.2026 - 30.09.2026")
 
     @labeler.message(state=AdminState.TOUR_ADD_DATES)
     async def tour_add_dates_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         dates = parse_date_range(message.text or "")
         if not dates:
             await message.answer("Не понял даты. Пример: 01.06.2026 - 30.09.2026")
             return
-
         start_date, end_date = dates
         payload = dict(message.state_peer.payload or {})
         payload["available_from"] = start_date
@@ -632,12 +1284,10 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def tour_add_description_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         description = (message.text or "").strip()
         if len(description) < 10:
             await message.answer("Описание слишком короткое. Сделайте его чуть подробнее.")
             return
-
         payload = dict(message.state_peer.payload or {})
         payload["description"] = description
         await _set_state(bot, message.peer_id, AdminState.TOUR_ADD_PHOTO, payload)
@@ -647,7 +1297,6 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def tour_add_photo_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         photo_text = (message.text or "").strip()
         photo_url = None if photo_text in {"-", "нет", "без фото"} else photo_text
         if photo_url and not photo_url.lower().startswith(("http://", "https://")):
@@ -670,7 +1319,8 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         )
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
-            "Процесс выполнен. Тур добавлен в каталог.",
+            "Процесс выполнен. Тур добавлен в каталог.\n"
+            "Подсказка: проверьте список через /tour_list.",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )
 
@@ -685,21 +1335,19 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def tour_disable_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         text = (message.text or "").strip()
         if not text.isdigit():
             await message.answer("Нужен ID тура.")
             return
-
         tour = await get_tour_by_id(int(text))
         if not tour:
             await message.answer("Тур с таким ID не найден.")
             return
-
         await set_tour_active(int(text), False)
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
-            f"Процесс выполнен. Тур #{text} отключен.",
+            f"Процесс выполнен. Тур #{text} отключен.\n"
+            "Подсказка: вернуть можно командой /tour_enable.",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )
 
@@ -714,21 +1362,19 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def tour_enable_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         text = (message.text or "").strip()
         if not text.isdigit():
             await message.answer("Нужен ID тура.")
             return
-
         tour = await get_tour_by_id(int(text))
         if not tour:
             await message.answer("Тур с таким ID не найден.")
             return
-
         await set_tour_active(int(text), True)
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
-            f"Процесс выполнен. Тур #{text} снова активен.",
+            f"Процесс выполнен. Тур #{text} снова активен.\n"
+            "Подсказка: список туров — /tour_list.",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )
 
@@ -737,29 +1383,25 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_admin(message):
             return
         await _set_state(bot, message.peer_id, AdminState.TOUR_PRICE)
-        await message.answer("Введите ID тура и новую цену.\nПример: 12 | 125000")
+        await message.answer("Введите ID тура и новую цену. Пример: 12 | 125000")
 
     @labeler.message(state=AdminState.TOUR_PRICE)
     async def tour_price_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         parsed = _parse_reply_payload(message.text or "")
         if not parsed:
-            await message.answer("Нужен формат: ID тура | цена\nПример: 12 | 125000")
+            await message.answer("Нужен формат: ID тура | цена. Пример: 12 | 125000")
             return
-
         tour_id, price_value = parsed
         price = parse_budget(price_value)
         if not price:
             await message.answer("Некорректная цена. Пример: 125000")
             return
-
         tour = await get_tour_by_id(tour_id)
         if not tour:
             await message.answer("Тур с таким ID не найден.")
             return
-
         await update_tour_price(tour_id, price)
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
@@ -774,7 +1416,6 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         content_key = CONTENT_LABELS.get((message.text or "").strip())
         if not content_key:
             return
-
         current_text = await get_content_block(content_key)
         await _set_state(bot, message.peer_id, AdminState.CONTENT_EDIT, {"content_key": content_key})
         await message.answer(
@@ -786,23 +1427,21 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
     async def content_edit_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         new_value = (message.text or "").strip()
         if len(new_value) < 10:
             await message.answer("Текст слишком короткий. Пришлите полный блок.")
             return
-
         payload = dict(message.state_peer.payload or {})
         content_key = payload.get("content_key")
         if not content_key:
             await bot.state_dispenser.delete(message.peer_id)
             await message.answer("Не удалось определить редактируемый блок. Откройте панель заново.")
             return
-
         await update_content_block(str(content_key), new_value)
         await bot.state_dispenser.delete(message.peer_id)
         await message.answer(
-            "Процесс выполнен. Текст обновлен.",
+            "Процесс выполнен. Текст обновлен.\n"
+            "Подсказка: проверьте блок в пользовательском меню.",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )
 
@@ -811,16 +1450,12 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         if not await _ensure_admin(message):
             return
         await _set_state(bot, message.peer_id, AdminState.BROADCAST)
-        await message.answer(
-            "Введите текст рассылки. Он будет отправлен всем пользователям бота.",
-            keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
-        )
+        await message.answer("Введите текст рассылки. Он будет отправлен всем пользователям бота.")
 
     @labeler.message(state=AdminState.BROADCAST)
     async def broadcast_state(message: Message) -> None:
         if await _handle_state_escape(bot, message):
             return
-
         text = (message.text or "").strip()
         if len(text) < 3:
             await message.answer("Текст слишком короткий. Пришлите нормальное сообщение для рассылки.")
@@ -843,6 +1478,7 @@ def register_admin_handlers(labeler: BotLabeler, bot: Bot) -> None:
         await bot.state_dispenser.delete(message.peer_id)
         await add_log(None, "broadcast", f"Broadcast sent success={success}, failed={failed}")
         await message.answer(
-            f"Процесс выполнен. Рассылка завершена.\nУспешно: {success}\nС ошибкой: {failed}",
+            f"Процесс выполнен. Рассылка завершена.\nУспешно: {success}\nС ошибкой: {failed}\n"
+            "Подсказка: перед следующей рассылкой проверьте актуальные статусы в /stats.",
             keyboard=_staff_keyboard(await get_staff_role(message.from_id)),
         )

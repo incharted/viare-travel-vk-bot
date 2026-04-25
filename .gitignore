@@ -1,12 +1,42 @@
+# Python
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and secrets
 .env
-.env.local
-.env.prod
-data/*.sqlite3
-data/*.db
-data/*.log
-data/*.log.*
-data/exports/
-data/bot.lock
+.env.*
+!.env.example
+.python_launcher.json
+
+# Runtime data
+data/
+*.sqlite3
+*.db
+*.log
+*.log.*
+*.lock
+
+# Generated exports and offers
+exports/
+*.csv
+*.xlsx
+*.pdf
+
+# Local documents and editor files
+*.docx
+~$*
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

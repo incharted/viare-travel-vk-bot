@@ -461,6 +461,11 @@ class Database:
                 full_name TEXT,
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 is_manager INTEGER NOT NULL DEFAULT 0,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                blocked_until TEXT,
+                block_reason TEXT,
+                spam_strikes INTEGER NOT NULL DEFAULT 0,
+                last_assigned_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -479,6 +484,10 @@ class Database:
                 rest_type TEXT,
                 status TEXT NOT NULL DEFAULT 'new',
                 manager_required INTEGER NOT NULL DEFAULT 0,
+                assigned_manager_vk_id INTEGER,
+                sla_15_sent INTEGER NOT NULL DEFAULT 0,
+                sla_30_sent INTEGER NOT NULL DEFAULT 0,
+                sla_60_sent INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(id)
@@ -518,6 +527,16 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS user_favorite_tours (
+                user_id INTEGER NOT NULL,
+                tour_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, tour_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(tour_id) REFERENCES tours(id) ON DELETE CASCADE
             );
             """,
         ]
@@ -576,6 +595,14 @@ class Database:
             await self._conn.execute(
                 "UPDATE requests SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP);"
             )
+        if "assigned_manager_vk_id" not in columns:
+            await self._conn.execute("ALTER TABLE requests ADD COLUMN assigned_manager_vk_id INTEGER;")
+        if "sla_15_sent" not in columns:
+            await self._conn.execute("ALTER TABLE requests ADD COLUMN sla_15_sent INTEGER NOT NULL DEFAULT 0;")
+        if "sla_30_sent" not in columns:
+            await self._conn.execute("ALTER TABLE requests ADD COLUMN sla_30_sent INTEGER NOT NULL DEFAULT 0;")
+        if "sla_60_sent" not in columns:
+            await self._conn.execute("ALTER TABLE requests ADD COLUMN sla_60_sent INTEGER NOT NULL DEFAULT 0;")
 
     async def _ensure_user_columns(self) -> None:
         if self._conn is None:
@@ -584,6 +611,16 @@ class Database:
         columns = await self._table_columns("users")
         if "is_manager" not in columns:
             await self._conn.execute("ALTER TABLE users ADD COLUMN is_manager INTEGER NOT NULL DEFAULT 0;")
+        if "is_blocked" not in columns:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0;")
+        if "blocked_until" not in columns:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN blocked_until TEXT;")
+        if "block_reason" not in columns:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN block_reason TEXT;")
+        if "spam_strikes" not in columns:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN spam_strikes INTEGER NOT NULL DEFAULT 0;")
+        if "last_assigned_at" not in columns:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN last_assigned_at TEXT;")
 
     async def _ensure_tour_columns(self) -> None:
         if self._conn is None:

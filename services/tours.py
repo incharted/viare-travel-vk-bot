@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from database.db import db
 
 
@@ -99,6 +101,98 @@ async def find_cheapest_destination_tours(
     return await db.fetchall(query, tuple(params))
 
 
+async def find_smart_date_suggestions(
+    travel_scope: str,
+    country: str,
+    destination: str | None,
+    travelers: int,
+    rest_type: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 2,
+) -> list[dict]:
+    requested_start = date.fromisoformat(start_date)
+    requested_end = date.fromisoformat(end_date)
+    duration_days = max((requested_end - requested_start).days, 1)
+
+    query = """
+        SELECT id, name, country, destination, price_per_person, duration_days, rest_type,
+               available_from, available_to
+        FROM tours
+        WHERE is_active = 1
+          AND lower(travel_scope) = lower(?)
+          AND lower(country) = lower(?)
+    """
+    params: list[object] = [travel_scope, country]
+    if rest_type != "any":
+        query += " AND lower(rest_type) = lower(?)"
+        params.append(rest_type)
+    query = _apply_destination_filter(query, params, travel_scope, destination)
+    query += " ORDER BY price_per_person ASC;"
+    tours = await db.fetchall(query, tuple(params))
+    if not tours:
+        return []
+
+    candidates: list[dict] = []
+    for tour in tours:
+        available_from_raw = tour.get("available_from")
+        available_to_raw = tour.get("available_to")
+        if not available_from_raw or not available_to_raw:
+            continue
+
+        available_from = date.fromisoformat(str(available_from_raw))
+        available_to = date.fromisoformat(str(available_to_raw))
+        latest_start = available_to - timedelta(days=duration_days)
+        if latest_start < available_from:
+            continue
+
+        if requested_start < available_from:
+            candidate_start = available_from
+        elif requested_start > latest_start:
+            candidate_start = latest_start
+        else:
+            candidate_start = requested_start
+        candidate_end = candidate_start + timedelta(days=duration_days)
+        shift_days = (candidate_start - requested_start).days
+
+        total_price = int(tour["price_per_person"]) * travelers
+        candidates.append(
+            {
+                "tour_id": int(tour["id"]),
+                "tour_name": str(tour["name"]),
+                "start_date": candidate_start.isoformat(),
+                "end_date": candidate_end.isoformat(),
+                "shift_days": shift_days,
+                "abs_shift_days": abs(shift_days),
+                "total_price": total_price,
+                "price_per_person": int(tour["price_per_person"]),
+                "rest_type": str(tour["rest_type"]),
+            }
+        )
+
+    if not candidates:
+        return []
+
+    exact_prices = [item["total_price"] for item in candidates if item["shift_days"] == 0]
+    baseline_exact = min(exact_prices) if exact_prices else None
+
+    smart_candidates = [
+        item for item in candidates if item["abs_shift_days"] > 0 and item["abs_shift_days"] <= 7
+    ]
+    smart_candidates.sort(key=lambda item: (item["abs_shift_days"], item["total_price"]))
+
+    result: list[dict] = []
+    for item in smart_candidates:
+        suggestion = dict(item)
+        suggestion["savings_vs_exact"] = (
+            baseline_exact - item["total_price"] if baseline_exact is not None else None
+        )
+        result.append(suggestion)
+        if len(result) >= limit:
+            break
+    return result
+
+
 async def get_destination_availability(
     travel_scope: str,
     country: str,
@@ -157,7 +251,7 @@ async def list_tours(limit: int = 20) -> list[dict]:
     )
 
 
-async def list_available_countries(limit: int = 30) -> list[str]:
+async def list_available_countries(limit: int = 24) -> list[str]:
     rows = await db.fetchall(
         """
         SELECT DISTINCT country
@@ -172,7 +266,7 @@ async def list_available_countries(limit: int = 30) -> list[str]:
     return [str(row["country"]) for row in rows if row.get("country")]
 
 
-async def list_domestic_destinations(limit: int = 30) -> list[str]:
+async def list_domestic_destinations(limit: int = 18) -> list[str]:
     rows = await db.fetchall(
         """
         SELECT DISTINCT destination

@@ -12,7 +12,8 @@ from vkbottle.tools import LoopWrapper
 from config import get_settings
 from database.db import db
 from handlers import register_all_handlers
-from middlewares import AuditMiddleware, RateLimitMiddleware, TextNormalizeMiddleware
+from middlewares import AntiFraudMiddleware, AuditMiddleware, RateLimitMiddleware, TextNormalizeMiddleware
+from services.sla import start_sla_worker
 from utils.logger import configure_logging
 from utils.single_instance import acquire_process_lock
 from utils.vk_http_client import VkAiohttpClient
@@ -45,6 +46,7 @@ def build_bot(loop: asyncio.AbstractEventLoop) -> Bot:
 
     # middleware chain for every incoming user message
     labeler.message_view.register_middleware(TextNormalizeMiddleware)
+    labeler.message_view.register_middleware(AntiFraudMiddleware)
     labeler.message_view.register_middleware(RateLimitMiddleware)
     labeler.message_view.register_middleware(AuditMiddleware)
 
@@ -66,6 +68,7 @@ def main() -> None:
 
     loop.run_until_complete(init_db(settings.db_path))
     bot = build_bot(loop)
+    start_sla_worker(loop, bot)
 
     logger.info("Bot started in %s mode", settings.app_env)
     try:

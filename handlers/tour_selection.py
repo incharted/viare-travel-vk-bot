@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from vkbottle.bot import Bot, BotLabeler, Message
 
@@ -15,11 +16,13 @@ from keyboards.main_menu import (
     get_rest_type_keyboard,
 )
 from services.admin import add_log
-from services.notifications import notify_managers
+from services.assignment import auto_assign_request
+from services.notifications import notify_assigned_manager
 from services.requests import create_request
 from services.tour_operator_api import fetch_external_offers
 from services.tours import (
     find_cheapest_destination_tours,
+    find_smart_date_suggestions,
     find_tours,
     find_tours_flexible,
     get_destination_availability,
@@ -73,6 +76,8 @@ DOMESTIC_DESTINATION_DESCRIPTIONS = {
     "Шерегеш": "Снег, трассы и горнолыжный формат зимой.",
 }
 
+WIZARD_TOTAL_STEPS = 6
+
 
 def _normalize_choice(text: str, options: list[str]) -> str | None:
     lowered = text.strip().lower()
@@ -105,6 +110,46 @@ def _format_availability_hint(availability: dict | None, travelers: int) -> str:
     )
 
 
+def _format_human_date(iso_date: str | None) -> str:
+    if not iso_date:
+        return "-"
+    try:
+        return date.fromisoformat(iso_date).strftime("%d.%m.%Y")
+    except ValueError:
+        return iso_date
+
+
+def _format_smart_dates_hint(suggestions: list[dict]) -> str:
+    if not suggestions:
+        return ""
+
+    lines = [
+        "Умные даты: нашёл более удобные окна сдвига по этому направлению.",
+        "Можно немного сдвинуть даты и получить подходящие варианты:",
+    ]
+    for item in suggestions:
+        shift = int(item.get("shift_days") or 0)
+        shift_text = f"+{shift} дн." if shift > 0 else f"{shift} дн."
+        total_price = int(item.get("total_price") or 0)
+        total_text = f"{total_price:,}".replace(",", " ")
+        saving = item.get("savings_vs_exact")
+        if isinstance(saving, int) and saving > 0:
+            saving_text = f" (экономия около {saving:,} ₽)".replace(",", " ")
+        else:
+            saving_text = ""
+        lines.append(
+            f"- {_format_human_date(str(item.get('start_date')))} - {_format_human_date(str(item.get('end_date')))} "
+            f"({shift_text}), ориентир {total_text} ₽{saving_text}"
+        )
+
+    lines.append("Если подходит один из вариантов, подтвердите заявку, и менеджер быстро всё оформит.")
+    return "\n".join(lines)
+
+
+def _step_header(step: int, title: str) -> str:
+    return f"Шаг {step}/{WIZARD_TOTAL_STEPS}. {title}"
+
+
 async def _ensure_user(message: Message) -> int:
     user = await get_user_by_vk_id(message.from_id)
     if user:
@@ -115,7 +160,8 @@ async def _ensure_user(message: Message) -> int:
 async def _show_scope_step(bot: Bot, message: Message) -> None:
     await bot.state_dispenser.set(message.peer_id, TourSelectionState.SCOPE)
     await message.answer(
-        "Сначала выберите формат поездки:",
+        _step_header(1, "Выберите формат поездки: по России или за границу.")
+        + "\nПодсказка: используйте кнопки ниже.",
         keyboard=get_destination_scope_keyboard(),
     )
 
@@ -203,7 +249,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             )
             await message.answer(
                 _format_destinations_prompt(
-                    "Выберите направление по России из списка или напишите его сообщением:",
+                    _step_header(2, "Выберите направление по России из списка или напишите вручную.")
+                    + "\nКоротко о направлениях:",
                     destinations,
                     DOMESTIC_DESTINATION_DESCRIPTIONS,
                 ),
@@ -220,7 +267,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             )
             await message.answer(
                 _format_destinations_prompt(
-                    "Выберите страну из списка или напишите ее сообщением:",
+                    _step_header(2, "Выберите страну из списка или напишите вручную.")
+                    + "\nКоротко о странах:",
                     countries,
                     ABROAD_COUNTRY_DESCRIPTIONS,
                 ),
@@ -229,7 +277,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             return
 
         await message.answer(
-            "Выберите один из вариантов: «По России» или «За границу».",
+            "Не понял формат поездки.\n"
+            "Выберите один из вариантов кнопкой: «По России» или «За границу».",
             keyboard=get_destination_scope_keyboard(),
         )
 
@@ -243,7 +292,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             destination = _normalize_choice(message.text or "", destinations)
             if not destination:
                 await message.answer(
-                    "Не понял направление. Выберите вариант из списка или напишите название точно так же.",
+                    "Не понял направление.\n"
+                    "Выберите вариант кнопкой или напишите название ровно как в списке.\n"
+                    "Пример: Сочи",
                     keyboard=get_domestic_destination_keyboard(destinations) if destinations else get_back_to_menu_keyboard(),
                 )
                 return
@@ -253,7 +304,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             country = normalize_country(message.text or "")
             if not country or country not in countries:
                 await message.answer(
-                    "Не понял страну. Выберите вариант из списка или напишите название точно так же.",
+                    "Не понял страну.\n"
+                    "Выберите вариант кнопкой или напишите название ровно как в списке.\n"
+                    "Пример: Турция",
                     keyboard=get_country_keyboard(countries) if countries else get_back_to_menu_keyboard(),
                 )
                 return
@@ -268,7 +321,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             awaiting_exact_dates=False,
         )
         await message.answer(
-            "Выберите месяц поездки или нажмите «Точные даты».",
+            _step_header(3, "Укажите даты поездки.")
+            + "\nВыберите месяц кнопкой или нажмите «Точные даты».",
             keyboard=get_month_keyboard(),
         )
 
@@ -285,7 +339,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
                 awaiting_exact_dates=True,
             )
             await message.answer(
-                "Введите даты в формате: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ",
+                _step_header(3, "Введите точные даты.")
+                + "\nФормат: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ\n"
+                "Пример: 10.07.2026 - 17.07.2026",
                 keyboard=get_back_to_menu_keyboard(),
             )
             return
@@ -293,7 +349,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
         date_range = parse_exact_date_range(text) if payload.get("awaiting_exact_dates") else parse_date_range(text)
         if not date_range:
             await message.answer(
-                "Не понял даты. Выберите месяц кнопкой или введите диапазон вроде 10.06.2026 - 20.06.2026.",
+                "Не понял даты.\n"
+                "Выберите месяц кнопкой или введите диапазон в формате:\n"
+                "10.06.2026 - 20.06.2026",
                 keyboard=get_month_keyboard() if not payload.get("awaiting_exact_dates") else get_back_to_menu_keyboard(),
             )
             return
@@ -309,7 +367,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             end_date=end_date,
         )
         await message.answer(
-            "Сколько туристов поедет? Введите число от 1 до 15.",
+            _step_header(4, "Сколько туристов поедет?")
+            + "\nВведите число от 1 до 15.\n"
+            "Пример: 2",
             keyboard=get_back_to_menu_keyboard(),
         )
 
@@ -318,7 +378,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
         travelers = parse_travelers(message.text or "")
         if travelers is None:
             await message.answer(
-                "Введите количество туристов числом от 1 до 15.",
+                "Количество туристов должно быть числом от 1 до 15.\n"
+                "Пример: 1, 2, 3",
                 keyboard=get_back_to_menu_keyboard(),
             )
             return
@@ -340,7 +401,10 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             end_date=payload["end_date"],
             travelers=travelers,
         )
-        prompt = "Укажите максимальный бюджет в рублях, например: 180000."
+        prompt = (
+            _step_header(5, "Укажите максимальный бюджет в рублях.")
+            + "\nПример: 180000"
+        )
         hint = _format_availability_hint(availability, travelers)
         if hint:
             prompt = f"{prompt}\n\n{hint}"
@@ -351,7 +415,9 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
         budget = parse_budget(message.text or "")
         if budget is None:
             await message.answer(
-                "Некорректный бюджет. Введите число от 10 000 до 20 000 000.",
+                "Некорректный бюджет.\n"
+                "Введите число от 10 000 до 20 000 000 без валюты.\n"
+                "Пример: 200000",
                 keyboard=get_back_to_menu_keyboard(),
             )
             return
@@ -369,7 +435,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             travelers=payload["travelers"],
         )
         await message.answer(
-            "Выберите тип отдыха. Если не принципиально, нажмите «Любой тип отдыха».",
+            _step_header(6, "Выберите тип отдыха.")
+            + "\nЕсли формат не важен, нажмите «Любой тип отдыха».",
             keyboard=get_rest_type_keyboard(),
         )
 
@@ -378,7 +445,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
         rest_type = normalize_rest_type(message.text or "")
         if not rest_type:
             await message.answer(
-                "Неизвестный тип отдыха. Используйте кнопку или выберите корректный вариант.",
+                "Неизвестный тип отдыха.\n"
+                "Используйте кнопки: пляжный, экскурсионный, активный, семейный и т.д.",
                 keyboard=get_rest_type_keyboard(),
             )
             return
@@ -399,8 +467,21 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
         exact_local_tours, flexible_local_tours, cheapest_local_tours, external_tours = await _load_preview_tours(
             confirmation_payload
         )
+        smart_date_suggestions: list[dict] = []
+        if not exact_local_tours and not flexible_local_tours:
+            smart_date_suggestions = await find_smart_date_suggestions(
+                travel_scope=confirmation_payload["travel_scope"],
+                country=confirmation_payload["country"],
+                destination=confirmation_payload["destination"],
+                travelers=int(confirmation_payload["travelers"]),
+                rest_type=str(confirmation_payload["rest_type"]),
+                start_date=str(confirmation_payload["start_date"]),
+                end_date=str(confirmation_payload["end_date"]),
+                limit=3,
+            )
         await message.answer(
-            format_request_summary_for_confirmation(confirmation_payload),
+            "Проверка перед отправкой заявки:\n"
+            + format_request_summary_for_confirmation(confirmation_payload),
             keyboard=get_request_confirmation_keyboard(),
         )
 
@@ -432,6 +513,11 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             )
             for tour in cheapest_local_tours[:3]:
                 await send_tour_message(bot, message, tour, int(confirmation_payload["travelers"]))
+            if smart_date_suggestions:
+                await message.answer(
+                    _format_smart_dates_hint(smart_date_suggestions),
+                    keyboard=get_request_confirmation_keyboard(),
+                )
             return
 
         if external_tours:
@@ -441,10 +527,22 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             )
             for tour in external_tours[:3]:
                 await send_tour_message(bot, message, tour, int(confirmation_payload["travelers"]))
+            if smart_date_suggestions:
+                await message.answer(
+                    _format_smart_dates_hint(smart_date_suggestions),
+                    keyboard=get_request_confirmation_keyboard(),
+                )
             return
 
+        if smart_date_suggestions:
+            await message.answer(
+                _format_smart_dates_hint(smart_date_suggestions),
+                keyboard=get_request_confirmation_keyboard(),
+            )
+
         await message.answer(
-            "Готовых совпадений прямо сейчас не нашел. Если подтвердите заявку, передам ее менеджеру для ручного подбора.",
+            "Готовых совпадений прямо сейчас не нашел.\n"
+            "Если нажмете «Подтверждаю», передам заявку менеджеру для ручного подбора.",
             keyboard=get_request_confirmation_keyboard(),
         )
 
@@ -515,16 +613,32 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
                 notification_text += f"\nАвтоподбор: найдены внешние варианты ({len(external_tours)} шт.)."
             else:
                 notification_text += "\nАвтоподбор: нужен ручной подбор менеджером."
-            await notify_managers(bot, notification_text)
+            assigned_manager_vk_id = await auto_assign_request(request_id)
+            if assigned_manager_vk_id:
+                notification_text += f"\nАвтораспределение: заявка закреплена за менеджером vk={assigned_manager_vk_id}."
+            else:
+                notification_text += "\nАвтораспределение: свободный менеджер не найден, нужна ручная фиксация."
+            await notify_assigned_manager(bot, notification_text, assigned_manager_vk_id)
 
             if exact_local_tours or flexible_local_tours or cheapest_local_tours or external_tours:
+                manager_hint = (
+                    "\nМенеджер уже занимается вашим вопросом."
+                    if assigned_manager_vk_id
+                    else "\nЗапрос передан команде менеджеров."
+                )
                 await message.answer(
-                    "Заявка сохранена. Я показал лучшие доступные варианты, а менеджер тоже увидит запрос и сможет помочь точнее.",
+                    "Заявка сохранена. Я показал лучшие доступные варианты, а менеджер тоже увидит запрос и сможет помочь точнее."
+                    + manager_hint,
                     keyboard=get_main_menu_keyboard(),
                 )
             else:
+                manager_hint = (
+                    "\nМенеджер уже занимается вашим вопросом."
+                    if assigned_manager_vk_id
+                    else "\nЗапрос передан команде менеджеров."
+                )
                 await message.answer(
-                    "Заявка сохранена и передана менеджеру для ручного подбора.",
+                    "Заявка сохранена и передана менеджеру для ручного подбора." + manager_hint,
                     keyboard=get_main_menu_keyboard(),
                 )
             return
@@ -534,6 +648,8 @@ def register_tour_handlers(labeler: BotLabeler, bot: Bot) -> None:
             return
 
         await message.answer(
-            "Нажмите «Подтверждаю», если все верно, или «Изменить запрос», если хотите заполнить заново.",
+            "Выберите действие:\n"
+            "- «Подтверждаю», если все верно\n"
+            "- «Изменить запрос», если хотите заполнить заново",
             keyboard=get_request_confirmation_keyboard(),
         )

@@ -37,6 +37,10 @@ async def export_requests_csv() -> Path:
                 "status_code",
                 "status_label",
                 "manager_required",
+                "assigned_manager_vk_id",
+                "sla_15_sent",
+                "sla_30_sent",
+                "sla_60_sent",
             ]
         )
         for row in rows:
@@ -57,6 +61,10 @@ async def export_requests_csv() -> Path:
                     row["status"],
                     request_status_label(row["status"]),
                     row["manager_required"],
+                    row.get("assigned_manager_vk_id") or "",
+                    row.get("sla_15_sent") or 0,
+                    row.get("sla_30_sent") or 0,
+                    row.get("sla_60_sent") or 0,
                 ]
             )
     return path
@@ -92,6 +100,10 @@ async def export_requests_xlsx() -> Path | None:
             "status_code",
             "status_label",
             "manager_required",
+            "assigned_manager_vk_id",
+            "sla_15_sent",
+            "sla_30_sent",
+            "sla_60_sent",
         ]
     )
     for row in rows:
@@ -112,6 +124,10 @@ async def export_requests_xlsx() -> Path | None:
                 row["status"],
                 request_status_label(row["status"]),
                 row["manager_required"],
+                row.get("assigned_manager_vk_id") or "",
+                row.get("sla_15_sent") or 0,
+                row.get("sla_30_sent") or 0,
+                row.get("sla_60_sent") or 0,
             ]
         )
 
